@@ -10,25 +10,30 @@ import AVFoundation
 import Combine
 import Foundation
 import HaishinKit
+import MultipeerMessages
+import ShazamKit
 import SwiftUI
 
-class AudioListener: NSObject, ObservableObject {
+class AudioListener: NSObject, ObservableObject, MetadataSource {
     
     let captureSession = AVCaptureSession()
     let audioOutput = AVCaptureAudioDataOutput()
+    var shazamSession = SHSession()
     
     @AppStorage("inputName") var inputName: String = "iMic"
     @AppStorage("offThreshold") var offThreshold: Double = -47.0
     @AppStorage("onThreshold") var onThreshold: Double = -30.0
     @AppStorage("disconnectDelay") var disconnectDelay: Double = 1200.0
+    @AppStorage("sampleLength") var sampleLength: Double = 5.0
+    @AppStorage("sampleDelay") var sampleDelay: Double = 10.0
     @AppStorage("onLength") var onLength: Double = 2.0
     @AppStorage("offLength") var offLength: Double = 4.0
-    @AppStorage("startAppleTV") var startAppleTV: Bool = false
+    @AppStorage("maxFiles") var maxFiles: Int = 8
     @AppStorage("pathToAtvRemote") var pathToATVRemote: String = ""
     @AppStorage("appleTVID") var appleTVID: String = ""
     @AppStorage("appleTVCredentials") var appleTVCredentials: String = ""
     
-    let sampleRate: Int = 8000
+    let sampleRate: Int = 16000
     @Published var connectionStatus = ConnectionStatus.disconnected
     @Published var averagePowerLevel: Float = Float.leastNormalMagnitude
     @Published var errorMessage: String? = nil
@@ -40,6 +45,60 @@ class AudioListener: NSObject, ObservableObject {
     var httpStream: HTTPStream?
     var httpService: HLSService?
     
+    internal var recognize = true {
+        didSet {
+            if !recognize {
+                // reset our session
+                shazamSession = SHSession()
+            }
+        }
+    }
+    
+    internal var blockBroadcast = false
+    fileprivate static let unknownAlbumImageName = "UnknownAlbum"
+    var albumImage = Image(unknownAlbumImageName) {
+        willSet {
+            objectWillChange.send()
+        }
+    }
+    
+    var albumImageURL: URL? {
+        willSet {
+            objectWillChange.send()
+            if newValue == nil {
+                // reset
+                albumImage = Image(Self.unknownAlbumImageName)
+            }
+            if let imageURL = newValue, !blockBroadcast {
+                multipeerManager?.broadcast(message: .imageURL(imageURL))
+            }
+        }
+    }
+    
+    fileprivate static let unknownAlbum = "Unknown Album"
+    fileprivate static let notPlayingAlbum = "Not Playing"
+    var albumTitle = notPlayingAlbum {
+        willSet {
+            objectWillChange.send()
+            if !blockBroadcast {
+                multipeerManager?.broadcast(message: .albumTitle(newValue))
+            }
+        }
+    }
+    fileprivate static let unknownArtist = "Unknown Artist"
+    fileprivate static let notPlayingArtist = ""
+    var albumArtist = notPlayingArtist {
+        willSet {
+            objectWillChange.send()
+            if !blockBroadcast {
+                multipeerManager?.broadcast(message: .artist(newValue))
+            }
+        }
+    }
+    
+    // Multipeer
+    var multipeerManager: MultipeerManager?
+    
     static var numberFormatter: NumberFormatter {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
@@ -49,6 +108,8 @@ class AudioListener: NSObject, ObservableObject {
     }
     
     func beginListening() {
+        multipeerManager = MultipeerManager(delegate: self)
+        shazamSession.delegate = self
         
         if captureSession.isRunning {
             captureSession.stopRunning()
@@ -89,17 +150,26 @@ class AudioListener: NSObject, ObservableObject {
         }
     }
     
+    /// must be called on main
     func beginStreaming() {
+        recognize = true
+        
         if connectionStatus == .waitingToDisconnect {
             connectionStatus = .connected
         }
         
         // connect to our apple tv if we have one
-        if startAppleTV && !pathToATVRemote.isEmpty && !appleTVID.isEmpty && !appleTVCredentials.isEmpty {
+        if !pathToATVRemote.isEmpty && !appleTVID.isEmpty && !appleTVCredentials.isEmpty {
             AppleTVUtilities.openTurncast(atvRemotePath: pathToATVRemote,
                                           appleTVID: appleTVID,
                                           appleTVCredentials: appleTVCredentials)
         }
+        
+        // broadcast temporary data
+        albumTitle = "Listening…"
+        albumArtist = ""
+        albumImageURL = nil
+        albumImage = Image(AudioListener.unknownAlbumImageName)
         
         // Stream
         httpStream = HTTPStream()
@@ -120,6 +190,7 @@ class AudioListener: NSObject, ObservableObject {
         }
     }
     
+    /// Must be called on main
     func endStreaming() {
         let service = httpService
         let stream = httpStream
@@ -139,6 +210,9 @@ class AudioListener: NSObject, ObservableObject {
         
         // set our connectionStatus
         connectionStatus = .waitingToDisconnect
+        
+        // prepare to recognize again
+        recognize = true
     }
 }
 
@@ -146,6 +220,20 @@ extension AudioListener: AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        
+        // generate a signature if we're connected
+        if connectionStatus == .connected && recognize {
+            // need to make a PCM buffer here
+            let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
+            if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) {
+                let avFormat = AVAudioFormat(cmAudioFormatDescription: formatDescription)
+                if let pcmBuffer = AVAudioPCMBuffer(pcmFormat: avFormat, frameCapacity: AVAudioFrameCount(numSamples)) {
+                    pcmBuffer.frameLength = AVAudioFrameCount(numSamples)
+                    CMSampleBufferCopyPCMDataIntoAudioBufferList(sampleBuffer, at: 0, frameCount: Int32(numSamples), into: pcmBuffer.mutableAudioBufferList)
+                    shazamSession.matchStreamingBuffer(pcmBuffer, at: nil)
+                }
+            }
+        }
         
         // downsample for perf
         if Date() > nextUIUpdateDate {
@@ -182,6 +270,73 @@ extension AudioListener: AVCaptureAudioDataOutputSampleBufferDelegate {
                 }
             }
             nextUIUpdateDate = Date(timeIntervalSinceNow: 1.0)
+        }
+    }
+}
+
+extension AudioListener: SHSessionDelegate {
+    func session(_ session: SHSession, didFind match: SHMatch) {
+        DispatchQueue.main.async { [weak self] in
+            guard let strongSelf = self else { return }
+            if let mediaItem = match.mediaItems.first {
+                let shAlbumKey: SHMediaItemProperty = SHMediaItemProperty("sh_albumName")
+                if let matchedAlbumName = mediaItem[shAlbumKey] as? String {
+                    strongSelf.albumTitle = matchedAlbumName
+                    strongSelf.albumArtist = mediaItem.artist ?? "Unknown Artist"
+                    strongSelf.recognize = false
+                } else {
+                    strongSelf.albumTitle = mediaItem.title ?? "Unknown Album"
+                    strongSelf.albumArtist = mediaItem.subtitle ?? "Unknown Artist"
+                    strongSelf.recognize = false
+                }
+                if let artworkURL = mediaItem.artworkURL {
+                    strongSelf.albumImageURL = artworkURL
+                    DispatchQueue.global(qos: .background).async { [weak self] in
+                        if let nsImage = NSImage(contentsOf: artworkURL) {
+                            let swiftImage = Image(nsImage: nsImage)
+                            DispatchQueue.main.async {
+                                guard let strongSelf = self else { return }
+                                strongSelf.albumImage = swiftImage
+                            }
+                        }
+                    }
+                }
+            } else {
+                strongSelf.albumTitle = "Unknown Album"
+                strongSelf.albumArtist = "Unknown Artist"
+                strongSelf.albumImageURL = nil
+            }
+        }
+    }
+    
+    func session(_ session: SHSession, didNotFindMatchFor signature: SHSignature, error: Error?) {
+        if let description = error?.localizedDescription {
+            print("Error Matching: " + description)
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let strongSelf = self else { return }
+            strongSelf.albumTitle = "Unknown Album"
+            strongSelf.albumArtist = "Unknown Artist"
+            if let unknownAlbumImage = NSImage(named: Self.unknownAlbumImageName) {
+                strongSelf.albumImage = Image(nsImage: unknownAlbumImage)
+                strongSelf.albumImageURL = nil
+            }
+        }
+    }
+}
+
+extension CGImage {
+    
+    enum CGImageWritingError: Error {
+        case imageDestinationCreationError
+        case imageFinalizationError
+    }
+    
+    func write(to url: URL) throws {
+        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, kUTTypePNG, 1, nil) else { throw CGImageWritingError.imageDestinationCreationError }
+        CGImageDestinationAddImage(destination, self, nil)
+        if !CGImageDestinationFinalize(destination) {
+            throw CGImageWritingError.imageFinalizationError
         }
     }
 }

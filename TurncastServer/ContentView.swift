@@ -13,9 +13,19 @@ struct ContentView: View {
     
     @ObservedObject var listener: AudioListener
     let formatter = NumberFormatter()
+    
+    @State var showingImageImporter = false
 
     var body: some View {
         VStack(spacing: 20.0) {
+            HStack(alignment: .center, spacing: 12.0) {
+                listener.albumImage.resizable().cornerRadius(6.0).frame(width: 100, height: 100)
+                VStack(alignment: .leading) {
+                    Text(listener.albumTitle).font(.headline)
+                    Text(listener.albumArtist).font(.subheadline)
+                }
+            }
+            
             if listener.errorMessage != nil {
                 Text(listener.errorMessage!)
                     .lineLimit(nil)
@@ -52,7 +62,7 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(width: 200, height: 100, alignment: .center)
+        .frame(width: 375, height: 250, alignment: .center)
         .onAppear {
             self.listener.beginListening()
         }

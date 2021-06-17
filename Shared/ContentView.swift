@@ -7,24 +7,25 @@
 //
 
 import AVFoundation
-import MediaPlayer
-import ShazamKit
 import SwiftUI
 
 struct ContentView: View {
     
     @StateObject var streamSource = StreamSource()
+    @StateObject var metadataStore = MetadataStore()
+    
+    let multipeerManager = MultipeerManager.shared
     
     var body: some View {
         VStack(alignment: .center) {
-            streamSource.albumArt
+            metadataStore.albumImage
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(height: albumArtSize)
                 .cornerRadius(12.0)
                 .padding()
-            Text(streamSource.title).font(.headline)
-            Text(streamSource.artist).font(.subheadline)
+            Text(metadataStore.albumTitle).font(.headline)
+            Text(metadataStore.artist).font(.subheadline)
             HStack {
                 #if os(iOS)
                 playStopButton
@@ -38,6 +39,11 @@ struct ContentView: View {
                     .frame(width: 50, height: 50)
                 #endif
             }.padding(.top, 40)
+        }.onAppear {
+            metadataStore.multipeerManager = multipeerManager
+            multipeerManager.metadataStore = metadataStore
+            multipeerManager.streamSource = streamSource
+            streamSource.multipeerManager = multipeerManager
         }
     }
     
